@@ -38,71 +38,121 @@ class BaseAgent:
             request: Request,
             response: Response
     ) -> Message:
-        client: AsyncDial = AsyncDial(
-            base_url=self.endpoint,
-            api_key=request.api_key,
-            api_version='2025-01-01-preview'
-        )
-
-        chunks = await client.chat.completions.create(
-            messages=self._prepare_messages(request.messages),
-            tools=[tool.schema for tool in self.tools],
-            stream=True,
-            deployment_name=deployment_name,
-        )
-
-        tool_call_index_map = {}
-        content = ''
-        custom_content: CustomContent = CustomContent(attachments=[])
-        async for chunk in chunks:
-            if chunk.choices and len(chunk.choices) > 0:
-                delta = chunk.choices[0].delta
-                if delta and delta.content:
-                    choice.append_content(delta.content)
-                    content += delta.content
-
-                if delta.tool_calls:
-                    for tool_call_delta in delta.tool_calls:
-                        if tool_call_delta.id:
-                            tool_call_index_map[tool_call_delta.index] = tool_call_delta
-                        else:
-                            tool_call = tool_call_index_map[tool_call_delta.index]
-                            if tool_call_delta.function:
-                                argument_chunk = tool_call_delta.function.arguments or ''
-                                tool_call.function.arguments += argument_chunk
-
-        assistant_message = Message(
-            role=Role.ASSISTANT,
-            content=content,
-            custom_content=custom_content,
-            tool_calls=[ToolCall.validate(tool_call) for tool_call in tool_call_index_map.values()]
-        )
-
-        if assistant_message.tool_calls:
-            tasks = [
-                self._process_tool_call(
-                    tool_call=tool_call,
-                    choice=choice,
-                    request=request,
-                    conversation_id=request.headers['x-conversation-id']
-                )
-                for tool_call in assistant_message.tool_calls
-            ]
-            tool_messages = await asyncio.gather(*tasks)
-
-            self.state[TOOL_CALL_HISTORY_KEY].append(assistant_message.dict(exclude_none=True))
-            self.state[TOOL_CALL_HISTORY_KEY].extend(tool_messages)
-
-            return await self.handle_request(
-                deployment_name=deployment_name,
-                choice=choice,
-                request=request,
-                response=response
+        try:
+            # Validate tools before use
+            if not self.tools:
+                raise ValueError("No tools available for the agent")
+            
+            # Filter out None tools and validate
+            valid_tools = [tool for tool in self.tools if tool is not None]
+            if not valid_tools:
+                raise ValueError("All tools are None or invalid")
+            
+            client: AsyncDial = AsyncDial(
+                base_url=self.endpoint,
+                api_key=request.api_key,
+                api_version='2025-01-01-preview'
             )
 
-        choice.set_state(self.state)
+            # Prepare tool schemas
+            tool_schemas = [tool.schema for tool in valid_tools]
+            
+            # Open the choice before appending content (only if not already opened)
+            if not choice.opened:
+                choice.open()
+            
+            chunks = await client.chat.completions.create(
+                messages=self._prepare_messages(request.messages),
+                tools=tool_schemas,
+                stream=True,
+                deployment_name=deployment_name,
+            )
 
-        return assistant_message
+            tool_call_index_map = {}
+            content = ''
+            custom_content: CustomContent = CustomContent(attachments=[])
+            async for chunk in chunks:
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    if delta and delta.content:
+                        choice.append_content(delta.content)
+                        content += delta.content
+
+                    if delta.tool_calls:
+                        for tool_call_delta in delta.tool_calls:
+                            if tool_call_delta.id:
+                                tool_call_index_map[tool_call_delta.index] = tool_call_delta
+                            else:
+                                tool_call = tool_call_index_map[tool_call_delta.index]
+                                if tool_call_delta.function:
+                                    argument_chunk = tool_call_delta.function.arguments or ''
+                                    tool_call.function.arguments += argument_chunk
+
+            assistant_message = Message(
+                role=Role.ASSISTANT,
+                content=content,
+                custom_content=custom_content,
+                tool_calls=[ToolCall.validate(tool_call) for tool_call in tool_call_index_map.values()]
+            )
+
+            if assistant_message.tool_calls:
+                tasks = [
+                    self._process_tool_call(
+                        tool_call=tool_call,
+                        choice=choice,
+                        request=request,
+                        conversation_id=request.headers.get('x-conversation-id', '')
+                    )
+                    for tool_call in assistant_message.tool_calls
+                ]
+                tool_messages = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Handle exceptions from tool calls
+                valid_tool_messages = []
+                for i, result in enumerate(tool_messages):
+                    if isinstance(result, Exception):
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.error(f"Tool call {i} failed: {result}", exc_info=True)
+                        # Create error message
+                        error_msg = Message(
+                            role=Role.TOOL,
+                            name=assistant_message.tool_calls[i].function.name,
+                            tool_call_id=assistant_message.tool_calls[i].id,
+                            content=f"Error: {str(result)}"
+                        )
+                        valid_tool_messages.append(error_msg.dict(exclude_none=True))
+                    else:
+                        valid_tool_messages.append(result)
+
+                self.state[TOOL_CALL_HISTORY_KEY].append(assistant_message.dict(exclude_none=True))
+                self.state[TOOL_CALL_HISTORY_KEY].extend(valid_tool_messages)
+
+                return await self.handle_request(
+                    deployment_name=deployment_name,
+                    choice=choice,
+                    request=request,
+                    response=response
+                )
+
+            # Set state (only if not already set, to avoid "Trying to set state twice" error)
+            try:
+                choice.set_state(self.state)
+            except Exception:
+                # State might already be set, ignore the error
+                pass
+
+            return assistant_message
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error in BaseAgent.handle_request: {type(e).__name__}: {str(e)}", exc_info=True)
+            # Set error state and re-raise
+            try:
+                choice.set_state(self.state)
+            except:
+                pass
+            raise
 
     def _prepare_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
         unpacked_messages = unpack_messages(messages, self.state[TOOL_CALL_HISTORY_KEY])

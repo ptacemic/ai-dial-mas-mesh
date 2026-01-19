@@ -1,10 +1,14 @@
 from task.agents.base_agent import BaseAgent
 from task.agents.content_management._prompts import SYSTEM_PROMPT
 from task.tools.base_tool import BaseTool
+from task.utils.constants import DIAL_ENDPOINT
 
 
-#TODO:
-# Just simply extend the BaseAgent and provide the constructor
+class ContentManagementAgent(BaseAgent):
 
-class ContentManagementAgent:
-    ...
+    def __init__(self, tools: list[BaseTool]):
+        super().__init__(
+            endpoint=DIAL_ENDPOINT,
+            system_prompt=SYSTEM_PROMPT,
+            tools=tools
+        )
